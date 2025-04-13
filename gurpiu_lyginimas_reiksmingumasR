@@ -1,0 +1,140 @@
+library(dplyr)
+
+install.packages(c("effsize", "rcompanion", "DescTools"))
+library(effsize)
+library(rcompanion)
+library(DescTools)
+
+
+# 1. Visų tavo kintamųjų sąrašas
+kintamieji <- c(
+  "Ranka", "Amžius", "KMI", "Nutukimas", "SOFA_1", "SOFA_7", "APACHE_II", "NRS_2002", "Admission Type",
+  "DPV_trukme_val.", "DPV", "CRB_max", "CRB_1_para", "CRB_5_para", "CRB_7_para", "PCT_max", "PCT_1_para",
+  "PCT_5_para", "PCT_7_para", "albuminas_min", "Laktatas_max_7", "Laktatas_max", "Laktatas_1_para",
+  "Laktatas_5_para", "Laktatas_7_para", "FK_%_pokytis_1-5", "FK_%_pokytis_1-7",
+  "Skeletal_muscle_mass_%_pokytis_1-5", "Skeletal_muscle_mass_%_pokytis_1-7",
+  "Viskas_%_pokytis_1-5", "Viskas_%_pokytis_1-7", "Pirmine_bakterine_infekcija", "Hospitaline_infekcija",
+  "Sepsis", "Hospitaline_pneumonija", "Pneumonija", "Intraabdominaline", "STI", "Kraujas", "Meningitas",
+  "Minkstieji_audiniai", "Zaizda", "Kaulai_sanariai", "CVK", "Kitos_infekcijos", "Reabilitacija"
+)
+
+# 2. Funkcija, kuri atlieka analizę pagal pasirinktą grupę
+analizuoti_pagal_grupe <- function(data, kintamieji, grupes_kintamasis) {
+  data_clean <- data %>% filter(!is.na(.data[[grupes_kintamasis]]))
+  numeric_vars <- kintamieji[sapply(data_clean[, kintamieji], is.numeric)]
+  categorical_vars <- setdiff(kintamieji, numeric_vars)
+  
+  # Skaitiniai
+  rez_skaitiniai <- lapply(numeric_vars, function(var) {
+    grp <- data_clean[[grupes_kintamasis]]
+    g1 <- data_clean %>% filter(grp == unique(grp)[1]) %>% pull(!!sym(var))
+    g2 <- data_clean %>% filter(grp == unique(grp)[2]) %>% pull(!!sym(var))
+    
+    if (length(na.omit(g1)) > 2 && length(na.omit(g2)) > 2) {
+      p_shapiro_1 <- tryCatch(shapiro.test(g1)$p.value, error = function(e) NA)
+      p_shapiro_2 <- tryCatch(shapiro.test(g2)$p.value, error = function(e) NA)
+      norm1 <- !is.na(p_shapiro_1) && p_shapiro_1 > 0.05
+      norm2 <- !is.na(p_shapiro_2) && p_shapiro_2 > 0.05
+      
+      if (norm1 && norm2) {
+        p_test <- t.test(as.formula(paste0("`", var, "` ~ `", grupes_kintamasis, "`")), data = data_clean)$p.value
+        test_used <- "t-test"
+      } else {
+        p_test <- wilcox.test(as.formula(paste0("`", var, "` ~ `", grupes_kintamasis, "`")), data = data_clean)$p.value
+        test_used <- "Wilcoxon"
+      }
+      
+      return(data.frame(
+        Kintamasis = var,
+        Grupavimas = grupes_kintamasis,
+        Tipas = "Skaitinis",
+        Testas = test_used,
+        P_reiksme = round(p_test, 4),
+        Stat_reiksmingas = ifelse(p_test < 0.05, "Taip", "Ne")
+      ))
+    } else {
+      return(NULL)
+    }
+  })
+  
+  # Kategoriniai
+  rez_kategoriniai <- lapply(categorical_vars, function(var) {
+    tab <- table(data_clean[[var]], data_clean[[grupes_kintamasis]])
+    if (all(dim(tab) >= 2)) {
+      test_type <- if (any(tab < 5)) "Fisher" else "Chi-squared"
+      p_val <- tryCatch({
+        if (test_type == "Fisher") fisher.test(tab)$p.value else chisq.test(tab)$p.value
+      }, error = function(e) NA)
+      
+      return(data.frame(
+        Kintamasis = var,
+        Grupavimas = grupes_kintamasis,
+        Tipas = "Kategorinis",
+        Testas = test_type,
+        P_reiksme = round(p_val, 4),
+        Stat_reiksmingas = ifelse(p_val < 0.05, "Taip", "Ne")
+      ))
+    } else {
+      return(NULL)
+    }
+  })
+  
+  do.call(rbind, c(rez_skaitiniai, rez_kategoriniai))
+}
+
+# 3. Paleidžiame analizę visoms trims grupėms
+rez_lytis <- analizuoti_pagal_grupe(data, kintamieji, "Lytis")
+rez_covid <- analizuoti_pagal_grupe(data, kintamieji, "Covid19")
+rez_nutukimas <- analizuoti_pagal_grupe(data, kintamieji, "Nutukimas")
+
+# Funkcija: Apskaičiuoti efektų dydžius reikšmingiems kintamiesiems
+skaiciuoti_efekto_dydzius <- function(df, gr_kint, original_data) {
+  sig_vars <- df %>% filter(Stat_reiksmingas == "Taip")
+  
+  efektai <- lapply(1:nrow(sig_vars), function(i) {
+    var <- sig_vars$Kintamasis[i]
+    testas <- sig_vars$Testas[i]
+    
+    if (testas == "t-test") {
+      d <- cohen.d(as.formula(paste0("`", var, "` ~ `", gr_kint, "`")), data = original_data)
+      return(data.frame(Kintamasis = var, Testas = testas, Efekto_dydis = round(d$estimate, 3), Tipas = "Cohen's d"))
+      
+    } else if (testas == "Wilcoxon") {
+      x <- original_data[[var]][original_data[[gr_kint]] == unique(original_data[[gr_kint]])[1]]
+      y <- original_data[[var]][original_data[[gr_kint]] == unique(original_data[[gr_kint]])[2]]
+      test <- wilcox.test(x, y)
+      z <- qnorm(test$p.value / 2) * -sign(median(x, na.rm = TRUE) - median(y, na.rm = TRUE))
+      r <- abs(z / sqrt(length(na.omit(x)) + length(na.omit(y))))
+      return(data.frame(Kintamasis = var, Testas = testas, Efekto_dydis = round(r, 3), Tipas = "r (rangų)"))
+      
+    } else if (testas == "Chi-squared") {
+      tab <- table(original_data[[var]], original_data[[gr_kint]])
+      v <- cramerV(tab)
+      return(data.frame(Kintamasis = var, Testas = testas, Efekto_dydis = round(v, 3), Tipas = "Cramer's V"))
+      
+    } else if (testas == "Fisher") {
+      tab <- table(original_data[[var]], original_data[[gr_kint]])
+      phi <- Phi(tab)
+      return(data.frame(Kintamasis = var, Testas = testas, Efekto_dydis = round(phi, 3), Tipas = "Phi"))
+    }
+    return(NULL)
+  })
+  
+  do.call(rbind, efektai)
+}
+
+
+# 4. Peržiūra – kiekviena lentelė atskirai
+View(rez_lytis)
+View(rez_covid)
+View(rez_nutukimas)
+
+#
+efektai_lytis <- skaiciuoti_efekto_dydzius(rez_lytis, "Lytis", data)
+efektai_covid <- skaiciuoti_efekto_dydzius(rez_covid, "Covid19", data)
+efektai_nutukimas <- skaiciuoti_efekto_dydzius(rez_nutukimas, "Nutukimas", data)
+
+View(efektai_lytis)
+View(efektai_covid)
+View(efektai_nutukimas)
+
